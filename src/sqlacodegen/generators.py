@@ -5,7 +5,7 @@ from abc import ABCMeta, abstractmethod
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from importlib import import_module
-from inspect import Parameter
+from inspect import Parameter, getmembers, ismethod
 from itertools import count
 from keyword import iskeyword
 from pprint import pformat
@@ -195,6 +195,7 @@ class TablesGenerator(CodeGenerator):
 
         type_ = type(obj) if not isinstance(obj, type) else obj
         pkgname = type_.__module__
+        type_name = type_.__name__
 
         # The column types have already been adapted towards generic types if possible, so if this
         # is still a vendor specific type (e.g., MySQL INTEGER) be sure to use that rather than the
@@ -202,6 +203,7 @@ class TablesGenerator(CodeGenerator):
         if pkgname.startswith('sqlalchemy.dialects.'):
             dialect_pkgname = '.'.join(pkgname.split('.')[0:3])
             dialect_pkg = import_module(dialect_pkgname)
+            type_name = type_.__name__ + " as " + pkgname.split('.')[2] + type_.__name__
 
             if type_.__name__ in dialect_pkg.__all__:  # type: ignore[attr-defined]
                 pkgname = dialect_pkgname
@@ -210,7 +212,7 @@ class TablesGenerator(CodeGenerator):
         else:
             pkgname = type_.__module__
 
-        self.add_literal_import(pkgname, type_.__name__)
+        self.add_literal_import(pkgname,type_name)
 
     def add_literal_import(self, pkgname: str, name: str) -> None:
         names = self.imports.setdefault(pkgname, set())
@@ -386,31 +388,53 @@ class TablesGenerator(CodeGenerator):
             if value is missing or value == default:
                 use_kwargs = True
             elif use_kwargs:
-                kwargs[param.name] = repr(value)
+                kwargs[param.name] = value
             else:
-                args.append(repr(value))
+                args.append(value)
 
         vararg = next((param.name for param in sig.parameters.values()
                        if param.kind is Parameter.VAR_POSITIONAL), None)
         if vararg and hasattr(coltype, vararg):
-            varargs_repr = [repr(arg) for arg in getattr(coltype, vararg)]
-            args.extend(varargs_repr)
+            varargs = [arg for arg in getattr(coltype, vararg)]
+            args.extend(varargs)
 
         if isinstance(coltype, Enum) and coltype.name is not None:
-            kwargs['name'] = repr(coltype.name)
+            kwargs['name'] = coltype.name
 
         if isinstance(coltype, JSONB):
             # Remove astext_type if it's the default
             if isinstance(coltype.astext_type, Text) and coltype.astext_type.length is None:
                 del kwargs['astext_type']
 
-        for key, value in kwargs.items():
-            args.append(f'{key}={value}')
 
+        # Check rendered is equivalent to coltype and add missing parameters
+        module = import_module(coltype.__class__.__module__)
+        TYPE = getattr(module, coltype.__class__.__name__)
+
+        rendered_type = TYPE(*args, **kwargs)
+        
+        if rendered_type.compile(self.bind.dialect) != coltype.compile(self.bind.dialect):
+            for (attr, value) in getmembers(coltype, lambda attr: not ismethod(attr)):
+
+                if not attr.startswith("_") and value.__class__.__module__ == "builtins":
+                    if getattr(rendered_type, attr) != value:
+                        kwargs[attr] = value
+                    
         rendered = coltype.__class__.__name__
+        pkgname = coltype.__class__.__module__
+
+        # Avoid dialect types shadowing generic types
+        if pkgname.startswith('sqlalchemy.dialects.'):
+            dialect = pkgname.split('.')[2]
+            rendered =  dialect + coltype.__class__.__name__
+
+        args = [repr(arg) for arg in args]
+        for key, value in kwargs.items():
+            args.append(f"{key}={repr(value)}")
+        
         if args:
             rendered += f"({', '.join(args)})"
-
+        
         return rendered
 
     def render_constraint(self, constraint: Any) -> str:
@@ -530,13 +554,14 @@ class TablesGenerator(CodeGenerator):
                     # If the adapted column type does not render the same as the original, don't
                     # substitute it
                     if new_coltype.compile(self.bind.dialect) != compiled_type:
-                        # Make an exception to the rule for Float and arrays of Float, since at
-                        # least on PostgreSQL, Float can accurately represent both REAL and
-                        # DOUBLE_PRECISION
-                        if not isinstance(new_coltype, Float) and \
-                           not (isinstance(new_coltype, ARRAY) and
-                                isinstance(new_coltype.item_type, Float)):
-                            break
+                        # # Make an exception to the rule for Float and arrays of Float, since at
+                        # # least on PostgreSQL, Float can accurately represent both REAL and
+                        # # DOUBLE_PRECISION
+                        # if not isinstance(new_coltype, Float) and \
+                        #    not (isinstance(new_coltype, ARRAY) and
+                        #         isinstance(new_coltype.item_type, Float)):
+                        #     break
+                        break
                 except CompileError:
                     # If the adapted column type can't be compiled, don't substitute it
                     break
